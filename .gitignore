@@ -1,0 +1,4 @@
+/caskdb
+*.test
+*.out
+/data/
