@@ -151,8 +151,8 @@ func (w *mergeWriter) write(rec *record) (entry, error) {
 	if _, err := w.data.Write(buf); err != nil {
 		return entry{}, err
 	}
-	e := entry{fileID: w.ids[len(w.ids)-1], offset: w.size, size: uint32(len(buf)), ts: rec.ts}
-	w.hints = appendHint(w.hints, hint{key: string(rec.key), ts: rec.ts, offset: e.offset, size: e.size})
+	e := entry{fileID: w.ids[len(w.ids)-1], offset: w.size, size: uint32(len(buf)), ts: rec.ts, expires: rec.expires}
+	w.hints = appendHint(w.hints, hint{key: string(rec.key), ts: rec.ts, offset: e.offset, size: e.size, expires: rec.expires})
 	w.size += int64(len(buf))
 	return e, nil
 }

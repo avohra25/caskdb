@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -41,6 +42,9 @@ type Options struct {
 	// writes reach the OS page cache immediately but are only durable after
 	// Sync, Close or file rotation.
 	SyncOnPut bool
+	// Now is the wall clock used for key expiry (default time.Now). Tests
+	// and simulations can replace it to control time.
+	Now func() time.Time
 }
 
 type entry struct {
@@ -48,7 +52,11 @@ type entry struct {
 	offset int64
 	size   uint32
 	ts     uint64
+	// expires is the key's expiry in unix milliseconds, or 0 for none.
+	expires int64
 }
+
+func (e entry) expired(nowMs int64) bool { return e.expires != 0 && nowMs >= e.expires }
 
 // DB is a handle to an open database directory. It is safe for concurrent
 // use by multiple goroutines.
@@ -92,6 +100,9 @@ func Open(dir string, opts *Options) (*DB, error) {
 	if o.MaxFileSize <= 0 {
 		o.MaxFileSize = DefaultMaxFileSize
 	}
+	if o.Now == nil {
+		o.Now = time.Now
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -113,6 +124,14 @@ func Open(dir string, opts *Options) (*DB, error) {
 		return nil, err
 	}
 	db.tombs = nil
+	// Keys that expired while the database was closed are dropped from the
+	// index straight away; their records are reclaimed by the next Merge.
+	now := db.nowMs()
+	for k, e := range db.keydir {
+		if e.expired(now) {
+			delete(db.keydir, k)
+		}
+	}
 	return db, nil
 }
 
@@ -237,8 +256,17 @@ func checkKV(key, value []byte) error {
 	return nil
 }
 
-// Put stores value under key, replacing any previous value.
+func (db *DB) nowMs() int64 { return db.opts.Now().UnixMilli() }
+
+// Put stores value under key, replacing any previous value and clearing any
+// expiry the key had.
 func (db *DB) Put(key, value []byte) error {
+	return db.put(key, value, 0)
+}
+
+// put writes key with the given expiry (unix ms, 0 = none). An expiry that
+// has already passed deletes the key instead, as Redis does.
+func (db *DB) put(key, value []byte, expires int64) error {
 	if err := checkKV(key, value); err != nil {
 		return err
 	}
@@ -247,8 +275,15 @@ func (db *DB) Put(key, value []byte) error {
 	if db.closed {
 		return ErrClosed
 	}
+	return db.putLocked(key, value, expires)
+}
+
+func (db *DB) putLocked(key, value []byte, expires int64) error {
+	if expires != 0 && expires <= db.nowMs() {
+		return db.deleteLocked(key)
+	}
 	db.clock++
-	e, err := db.appendLocked(&record{ts: db.clock, key: key, value: value})
+	e, err := db.appendLocked(&record{ts: db.clock, expires: expires, key: key, value: value})
 	if err != nil {
 		return err
 	}
@@ -266,7 +301,18 @@ func (db *DB) Delete(key []byte) error {
 	if db.closed {
 		return ErrClosed
 	}
-	if _, ok := db.keydir[string(key)]; !ok {
+	return db.deleteLocked(key)
+}
+
+func (db *DB) deleteLocked(key []byte) error {
+	cur, ok := db.keydir[string(key)]
+	if !ok {
+		return nil
+	}
+	if cur.expired(db.nowMs()) {
+		// The expired record already hides every older version of the key,
+		// so no tombstone is needed; just forget it.
+		delete(db.keydir, string(key))
 		return nil
 	}
 	db.clock++
@@ -294,7 +340,7 @@ func (db *DB) appendLocked(r *record) (entry, error) {
 			return entry{}, err
 		}
 	}
-	e := entry{fileID: db.activeID, offset: db.activeSize, size: uint32(len(buf)), ts: r.ts}
+	e := entry{fileID: db.activeID, offset: db.activeSize, size: uint32(len(buf)), ts: r.ts, expires: r.expires}
 	db.activeSize += int64(len(buf))
 	return e, nil
 }
@@ -316,7 +362,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		return nil, ErrClosed
 	}
 	e, ok := db.keydir[string(key)]
-	if !ok {
+	if !ok || e.expired(db.nowMs()) {
 		return nil, ErrNotFound
 	}
 	rec, err := db.readLocked(e)
@@ -341,27 +387,36 @@ func (db *DB) readLocked(e entry) (*record, error) {
 	return decodeRecord(buf)
 }
 
-// Has reports whether key is present.
+// Has reports whether key is present and not expired.
 func (db *DB) Has(key []byte) bool {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	_, ok := db.keydir[string(key)]
-	return ok
+	e, ok := db.keydir[string(key)]
+	return ok && !e.expired(db.nowMs())
 }
 
-// Len returns the number of live keys.
+// Len returns the number of live (unexpired) keys.
 func (db *DB) Len() int {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return len(db.keydir)
+	now, n := db.nowMs(), 0
+	for _, e := range db.keydir {
+		if !e.expired(now) {
+			n++
+		}
+	}
+	return n
 }
 
-// Keys returns all live keys in sorted order.
+// Keys returns all live (unexpired) keys in sorted order.
 func (db *DB) Keys() []string {
 	db.mu.RLock()
+	now := db.nowMs()
 	keys := make([]string, 0, len(db.keydir))
-	for k := range db.keydir {
-		keys = append(keys, k)
+	for k, e := range db.keydir {
+		if !e.expired(now) {
+			keys = append(keys, k)
+		}
 	}
 	db.mu.RUnlock()
 	sort.Strings(keys)
@@ -398,7 +453,8 @@ func (db *DB) Sync() error {
 
 // Stats describes the on-disk state of a database.
 type Stats struct {
-	Keys      int
+	Keys      int // live keys, excluding expired ones
+	Expiring  int // live keys that have an expiry set
 	DataFiles int
 	DiskBytes int64 // total size of all data files
 	LiveBytes int64 // bytes occupied by the latest version of live keys
@@ -411,8 +467,16 @@ func (db *DB) Stats() (Stats, error) {
 	if db.closed {
 		return Stats{}, ErrClosed
 	}
-	s := Stats{Keys: len(db.keydir), DataFiles: len(db.files)}
+	s := Stats{DataFiles: len(db.files)}
+	now := db.nowMs()
 	for _, e := range db.keydir {
+		if e.expired(now) {
+			continue
+		}
+		s.Keys++
+		if e.expires != 0 {
+			s.Expiring++
+		}
 		s.LiveBytes += int64(e.size)
 	}
 	for _, f := range db.files {

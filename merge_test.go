@@ -185,7 +185,7 @@ func TestCorruptHintFallsBackToData(t *testing.T) {
 }
 
 func TestHintRoundTrip(t *testing.T) {
-	in := []hint{{"alpha", 1, 0, 30}, {"beta", 7, 30, 99}}
+	in := []hint{{"alpha", 1, 0, 30, 0}, {"beta", 7, 30, 99, 1793300000000}, {"gamma", 9, 129, 40, 0}}
 	var buf []byte
 	for _, h := range in {
 		buf = appendHint(buf, h)

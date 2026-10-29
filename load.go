@@ -43,7 +43,7 @@ func (db *DB) loadFile(id uint32, f *os.File, last bool) error {
 		return err
 	}
 	end, err := scanRecords(f, func(r *record, off int64, size uint32) error {
-		db.applyLoaded(string(r.key), r.tombstone(), entry{fileID: id, offset: off, size: size, ts: r.ts})
+		db.applyLoaded(string(r.key), r.tombstone(), entry{fileID: id, offset: off, size: size, ts: r.ts, expires: r.expires})
 		return nil
 	})
 	if err == nil {
@@ -74,7 +74,7 @@ func (db *DB) loadHint(id uint32) (bool, error) {
 		return false, nil
 	}
 	for _, h := range hints {
-		db.applyLoaded(h.key, false, entry{fileID: id, offset: h.offset, size: h.size, ts: h.ts})
+		db.applyLoaded(h.key, false, entry{fileID: id, offset: h.offset, size: h.size, ts: h.ts, expires: h.expires})
 	}
 	return true, nil
 }
