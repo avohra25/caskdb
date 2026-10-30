@@ -9,6 +9,8 @@ server so `redis-cli` and ordinary Redis clients can talk to it.
 - Automatic file rotation and torn-write recovery after a crash
 - Online compaction (`Merge`) that runs alongside reads and writes, writes
   hint files for fast startup, and is crash safe
+- Per-key expiry (TTL) with millisecond resolution, persisted in the log,
+  dropped by merge, with optional background sweeping
 - Concurrent-safe `*DB` handle, advisory directory lock on Unix
 - Zero dependencies outside the standard library
 
@@ -44,8 +46,35 @@ db.Stats()                           // keys, files, disk vs live bytes
 |---|---|---|
 | `MaxFileSize` | 64 MiB | Rotate the active data file once it would exceed this size |
 | `SyncOnPut` | `false` | `fsync` after every write. Otherwise data is durable after `Sync`, `Close` or rotation |
+| `SweepInterval` | `0` (off) | Drop expired keys from the in-memory index this often |
+| `Now` | `time.Now` | Wall clock used for expiry; swap it out in tests |
 
 Keys are 1 byte to 64 KiB and values up to 64 MiB; both are arbitrary bytes.
+
+### Key expiry
+
+```go
+db.PutWithTTL([]byte("session:42"), token, 30*time.Minute)
+db.PutWithExpiry([]byte("promo"), data, time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC))
+
+db.TTL([]byte("session:42"))              // 29m59.98s; caskdb.NoTTL if permanent
+db.ExpiresAt([]byte("session:42"))        // absolute time; zero Time if permanent
+db.Expire([]byte("user:1"), time.Hour)    // add or change a TTL on an existing key
+db.Persist([]byte("session:42"))          // make it permanent again
+db.SweepExpired()                         // free index memory held by expired keys
+```
+
+Expired keys behave exactly like deleted ones: `Get` returns `ErrNotFound`
+and they vanish from `Has`, `Len`, `Keys`, `Fold` and `Stats`. A plain `Put`
+clears any TTL (as in Redis), and an expiry that is already in the past
+deletes the key. Expiry is stored in the data record itself, so it survives
+restarts and merges, and a key that expired while the database was closed is
+gone when it reopens.
+
+Expired records are reclaimed by `Merge`. Deleting an expired key writes no
+tombstone, because the expired record already hides every older version.
+Merge can drop an expired record outright for the same reason: all older
+versions of the key live in the sealed files that the merge replaces.
 
 ## Server and CLI
 
@@ -59,8 +88,28 @@ $ redis-cli -p 6380 KEYS 'gr*'
 1) "greeting"
 ```
 
-Supported commands: `PING`, `ECHO`, `GET`, `SET`, `DEL`, `EXISTS`, `KEYS`
-(glob patterns), `DBSIZE`, `MERGE`, `INFO`, `QUIT`. Both RESP arrays and inline
+Supported commands: `PING`, `ECHO`, `GET`, `SET`, `SETEX`, `PSETEX`, `DEL`,
+`EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`,
+`EXPIRETIME`, `PEXPIRETIME`, `PERSIST`, `KEYS` (glob patterns), `DBSIZE`,
+`MERGE`, `INFO`, `QUIT`.
+
+`SET` takes the Redis options `NX`, `XX`, `GET`, `EX`, `PX`, `EXAT`, `PXAT`
+and `KEEPTTL`, and the `EXPIRE` family takes `NX`, `XX`, `GT` and `LT`.
+Replies follow Redis 7, including `-2`/`-1` from `TTL` for missing and
+permanent keys. Conditional commands are atomic across clients, so
+`SET lock token NX PX 30000` works as a simple lock:
+
+```sh
+$ redis-cli -p 6380 SET lock worker-1 NX PX 30000
+OK
+$ redis-cli -p 6380 SET lock worker-2 NX PX 30000
+(nil)
+$ redis-cli -p 6380 PTTL lock
+(integer) 29874
+```
+
+`caskdb serve` sweeps expired keys from memory once a minute
+(`-sweep 0` turns that off). Both RESP arrays and inline
 commands (`printf 'GET greeting\r\n' | nc localhost 6380`) work, and pipelined
 commands are answered in a single write.
 
@@ -71,6 +120,10 @@ the directory is locked):
 caskdb put -dir ./data name caskdb
 echo "from stdin" | caskdb put -dir ./data piped
 caskdb get -dir ./data name
+caskdb put -dir ./data -ttl 10m session abc
+caskdb ttl -dir ./data session                 # 9m58.204s
+caskdb expire -dir ./data name 24h
+caskdb persist -dir ./data name
 caskdb keys -dir ./data
 caskdb del -dir ./data name
 caskdb merge -dir ./data
@@ -124,14 +177,17 @@ Data record (little endian):
 |---|---|---|
 | crc32 | 4 | IEEE checksum of everything after this field |
 | ts | 8 | logical timestamp, monotonic per database |
-| flags | 1 | bit 0 = tombstone |
+| flags | 1 | bit 0 = tombstone, bit 1 = has expiry |
 | ksize | 4 | |
-| vsize | 4 | |
+| vsize | 4 | value length, plus 8 when bit 1 is set |
 | key | ksize | |
+| expiry | 8 | unix milliseconds, only when bit 1 is set |
 | value | vsize | |
 
-Hint entry: `crc32(4) ts(8) offset(8) size(4) ksize(4) key`. A damaged hint
-file is ignored and the data file is scanned instead.
+Hint entry: `crc32(4) ts(8) offset(8) size(4) ksize(4) key [expiry(8)]`,
+where the high bit of `ksize` marks an expiry. A damaged hint file is ignored
+and the data file is scanned instead. Files written before expiry support
+never set either bit, so existing databases open unchanged.
 
 ## Benchmarks
 
@@ -152,6 +208,9 @@ file is ignored and the data file is scanned instead.
 - Every live key, plus a small fixed-size index entry, is held in memory.
 - One process per directory; it is not replicated or distributed.
 - No range scans beyond sorted `Keys()`; this is a hash index, not a tree.
+- Expiry follows the wall clock. Moving the clock forward expires keys early;
+  moving it back can make a key that has not been merged away yet visible
+  again.
 
 ## Development
 

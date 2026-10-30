@@ -450,3 +450,20 @@ func TestExpiryUnderConcurrency(t *testing.T) {
 		}
 	}
 }
+
+func TestExpiresAt(t *testing.T) {
+	clk := newClock()
+	db := openT(t, t.TempDir(), &Options{Now: clk.Now})
+	defer db.Close()
+	if _, err := db.ExpiresAt([]byte("k")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing: %v", err)
+	}
+	db.Put([]byte("k"), []byte("v"))
+	if at, err := db.ExpiresAt([]byte("k")); err != nil || !at.IsZero() {
+		t.Fatalf("permanent: %v, %v", at, err)
+	}
+	db.Expire([]byte("k"), 90*time.Second)
+	if at, _ := db.ExpiresAt([]byte("k")); !at.Equal(clk.Now().Add(90 * time.Second)) {
+		t.Fatalf("ExpiresAt = %v", at)
+	}
+}

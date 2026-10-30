@@ -159,3 +159,21 @@ func (db *DB) stopSweeper() {
 		<-db.sweepDone
 	})
 }
+
+// ExpiresAt returns the time at which key expires, the zero Time if it
+// never expires, or ErrNotFound if it is missing or already expired.
+func (db *DB) ExpiresAt(key []byte) (time.Time, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return time.Time{}, ErrClosed
+	}
+	e, ok := db.keydir[string(key)]
+	switch {
+	case !ok || e.expired(db.nowMs()):
+		return time.Time{}, ErrNotFound
+	case e.expires == 0:
+		return time.Time{}, nil
+	}
+	return time.UnixMilli(e.expires), nil
+}

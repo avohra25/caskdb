@@ -2,9 +2,13 @@
 // Redis protocol (RESP2), so redis-cli and ordinary Redis client libraries
 // can talk to it.
 //
-// Supported commands: PING [msg], ECHO msg, GET key, SET key value,
-// DEL key [key ...], EXISTS key [key ...], KEYS [pattern], DBSIZE, MERGE,
-// INFO, QUIT.
+// Supported commands: PING [msg], ECHO msg, GET key,
+// SET key value [NX|XX] [GET] [EX s|PX ms|EXAT ts|PXAT ms-ts|KEEPTTL],
+// SETEX key s value, PSETEX key ms value, DEL key [key ...],
+// EXISTS key [key ...], EXPIRE/PEXPIRE key ttl [NX|XX|GT|LT],
+// EXPIREAT/PEXPIREAT key ts [NX|XX|GT|LT], TTL key, PTTL key,
+// EXPIRETIME key, PEXPIRETIME key, PERSIST key, KEYS [pattern], DBSIZE,
+// MERGE, INFO, QUIT.
 package server
 
 import (
@@ -25,6 +29,10 @@ import (
 type Server struct {
 	DB     *caskdb.DB
 	Logger *log.Logger // optional
+
+	// wmu serialises commands that read and then write (SET NX, EXPIRE GT,
+	// DEL, ...) so each one is atomic with respect to other clients.
+	wmu sync.Mutex
 
 	mu    sync.Mutex
 	ln    net.Listener
@@ -189,18 +197,39 @@ func (s *Server) dispatch(w *bufio.Writer, args [][]byte) bool {
 			writeBulk(w, v)
 		}
 	case "SET":
-		if !arity(w, name, args, 2, 2) {
+		if arity(w, name, args, 2, -1) {
+			s.set(w, args)
+		}
+	case "SETEX", "PSETEX":
+		if arity(w, name, args, 3, 3) {
+			s.setex(w, name, args)
+		}
+	case "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT":
+		if arity(w, name, args, 2, 3) {
+			s.expire(w, name, args)
+		}
+	case "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME":
+		if arity(w, name, args, 1, 1) {
+			s.ttl(w, name, args[1])
+		}
+	case "PERSIST":
+		if !arity(w, name, args, 1, 1) {
 			break
 		}
-		if err := s.DB.Put(args[1], args[2]); err != nil {
+		s.wmu.Lock()
+		ok, err := s.DB.Persist(args[1])
+		s.wmu.Unlock()
+		if err != nil {
 			writeError(w, "ERR "+err.Error())
 		} else {
-			writeSimple(w, "OK")
+			writeInt(w, boolInt(ok))
 		}
 	case "DEL":
 		if !arity(w, name, args, 1, -1) {
 			break
 		}
+		s.wmu.Lock()
+		defer s.wmu.Unlock()
 		var n int64
 		for _, k := range args[1:] {
 			if !s.DB.Has(k) {
@@ -262,8 +291,8 @@ func (s *Server) dispatch(w *bufio.Writer, args [][]byte) bool {
 			writeError(w, "ERR "+err.Error())
 			break
 		}
-		writeBulk(w, []byte(fmt.Sprintf("# caskdb\r\nkeys:%d\r\ndata_files:%d\r\ndisk_bytes:%d\r\nlive_bytes:%d\r\n",
-			st.Keys, st.DataFiles, st.DiskBytes, st.LiveBytes)))
+		writeBulk(w, []byte(fmt.Sprintf("# caskdb\r\nkeys:%d\r\nexpiring_keys:%d\r\nexpired_pending:%d\r\ndata_files:%d\r\ndisk_bytes:%d\r\nlive_bytes:%d\r\n",
+			st.Keys, st.Expiring, st.Expired, st.DataFiles, st.DiskBytes, st.LiveBytes)))
 	case "QUIT":
 		writeSimple(w, "OK")
 		return true
