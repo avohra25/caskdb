@@ -301,3 +301,152 @@ func TestOldFormatHintStillLoads(t *testing.T) {
 		t.Fatalf("decode: %v, %v", hs, err)
 	}
 }
+
+func TestMergeDropsExpiredKeys(t *testing.T) {
+	clk := newClock()
+	dir := t.TempDir()
+	opts := &Options{Now: clk.Now}
+	db := openT(t, dir, opts)
+	db.Put([]byte("keep"), []byte("forever"))
+	db.Put([]byte("gone"), []byte("old permanent value"))
+	db.PutWithTTL([]byte("gone"), []byte("temporary"), time.Second)
+	db.PutWithTTL([]byte("later"), []byte("still here"), time.Hour)
+	clk.Advance(2 * time.Second)
+
+	if err := db.Merge(); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := db.Stats()
+	if st.Keys != 2 || st.Expired != 0 || st.Expiring != 1 {
+		t.Fatalf("after merge: %+v", st)
+	}
+	if _, ok := db.keydir["gone"]; ok {
+		t.Fatal("expired key still indexed after merge")
+	}
+	if st.DiskBytes != st.LiveBytes {
+		t.Fatalf("merge kept dead bytes: disk %d, live %d", st.DiskBytes, st.LiveBytes)
+	}
+	db.Close()
+
+	// Neither the expired value nor the permanent value it replaced may
+	// come back after a restart.
+	clk.Advance(-time.Hour) // even with the clock moved back
+	db = openT(t, dir, opts)
+	defer db.Close()
+	mustMissing(t, db, "gone")
+	mustGet(t, db, "keep", "forever")
+	mustGet(t, db, "later", "still here")
+}
+
+func TestMergeKeepsKeyRewrittenDuringMerge(t *testing.T) {
+	clk := newClock()
+	db := openT(t, t.TempDir(), &Options{Now: clk.Now})
+	defer db.Close()
+	db.PutWithTTL([]byte("k"), []byte("v1"), time.Second)
+	clk.Advance(2 * time.Second)
+	db.Merge()
+	db.Put([]byte("k"), []byte("v2"))
+	db.Merge()
+	mustGet(t, db, "k", "v2")
+}
+
+func TestSweepExpired(t *testing.T) {
+	clk := newClock()
+	db := openT(t, t.TempDir(), &Options{Now: clk.Now})
+	defer db.Close()
+	for i := 0; i < 100; i++ {
+		k := []byte{byte('a' + i%26), byte('0' + i/26)}
+		if i%4 == 0 {
+			db.Put(k, []byte("p"))
+		} else {
+			db.PutWithTTL(k, []byte("t"), time.Duration(i)*time.Second)
+		}
+	}
+	clk.Advance(50 * time.Second)
+	st, _ := db.Stats()
+	n, err := db.SweepExpired()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 || n != st.Expired {
+		t.Fatalf("swept %d, stats reported %d expired", n, st.Expired)
+	}
+	if len(db.keydir) != st.Keys {
+		t.Fatalf("index has %d entries, want %d", len(db.keydir), st.Keys)
+	}
+	if n, _ := db.SweepExpired(); n != 0 {
+		t.Fatalf("second sweep removed %d", n)
+	}
+}
+
+func TestBackgroundSweeper(t *testing.T) {
+	clk := newClock()
+	db := openT(t, t.TempDir(), &Options{Now: clk.Now, SweepInterval: time.Millisecond})
+	db.PutWithTTL([]byte("k"), []byte("v"), time.Second)
+	clk.Advance(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		db.mu.RLock()
+		n := len(db.keydir)
+		db.mu.RUnlock()
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background sweeper never removed the expired key")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestExpiryUnderConcurrency(t *testing.T) {
+	clk := newClock()
+	db := openT(t, t.TempDir(), &Options{Now: clk.Now, SweepInterval: time.Millisecond, MaxFileSize: 4 << 10})
+	defer db.Close()
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 300; i++ {
+				k := []byte{byte('a' + g), byte(i % 50)}
+				switch i % 3 {
+				case 0:
+					db.PutWithTTL(k, []byte("ttl"), time.Duration(i%7+1)*time.Millisecond)
+				case 1:
+					db.Put(k, []byte("plain"))
+				default:
+					db.Get(k)
+					db.TTL(k)
+				}
+				if i%50 == 0 {
+					clk.Advance(3 * time.Millisecond)
+				}
+			}
+		}(g)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			if err := db.Merge(); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	clk.Advance(time.Second)
+	for _, k := range db.Keys() {
+		v, err := db.Get([]byte(k))
+		if err != nil || string(v) != "plain" {
+			t.Fatalf("key %q after all TTLs passed: %q, %v", k, v, err)
+		}
+	}
+}

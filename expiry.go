@@ -114,3 +114,48 @@ func (db *DB) TTL(key []byte) (time.Duration, error) {
 	}
 	return time.Duration(e.expires-now) * time.Millisecond, nil
 }
+
+// SweepExpired removes every expired key from the in-memory index and
+// returns how many it removed. Their records stay on disk until the next
+// Merge. It holds the write lock for one pass over the index.
+func (db *DB) SweepExpired() (int, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return 0, ErrClosed
+	}
+	now, n := db.nowMs(), 0
+	for k, e := range db.keydir {
+		if e.expired(now) {
+			delete(db.keydir, k)
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (db *DB) sweepLoop(every time.Duration) {
+	defer close(db.sweepDone)
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-db.sweepStop:
+			return
+		case <-t.C:
+			if _, err := db.SweepExpired(); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (db *DB) stopSweeper() {
+	if db.sweepStop == nil {
+		return
+	}
+	db.stopOnce.Do(func() {
+		close(db.sweepStop)
+		<-db.sweepDone
+	})
+}

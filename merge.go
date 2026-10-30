@@ -14,8 +14,8 @@ const manifestName = "MERGE_MANIFEST"
 
 // Merge compacts the database: the live value of every key held in sealed
 // data files is copied into fresh files (with hint files for fast startup),
-// and the old files are deleted. Overwritten values and tombstones are
-// dropped. Reads and writes continue while the copy runs; only the final
+// and the old files are deleted. Overwritten values, tombstones and expired
+// keys are dropped. Reads and writes continue while the copy runs; only the final
 // index swap takes the write lock.
 //
 // Crash safety: outputs are written under temporary names, fsynced and
@@ -62,7 +62,16 @@ func (db *DB) Merge() error {
 
 	w := &mergeWriter{db: db}
 	moved := make([]entry, len(items))
+	dropped := make([]bool, len(items))
+	now := db.nowMs()
 	for i, it := range items {
+		// An expired record can be discarded outright: every older version
+		// of its key lives in a sealed file that this merge also deletes,
+		// so nothing is left for it to shadow.
+		if it.e.expired(now) {
+			dropped[i] = true
+			continue
+		}
 		db.mu.RLock()
 		rec, err := db.readLocked(it.e)
 		db.mu.RUnlock()
@@ -102,7 +111,11 @@ func (db *DB) Merge() error {
 	}
 	for i, it := range items {
 		if cur, ok := db.keydir[it.key]; ok && cur == it.e {
-			db.keydir[it.key] = moved[i]
+			if dropped[i] {
+				delete(db.keydir, it.key)
+			} else {
+				db.keydir[it.key] = moved[i]
+			}
 		}
 	}
 	for _, id := range oldIDs {

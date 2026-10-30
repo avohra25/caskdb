@@ -45,6 +45,11 @@ type Options struct {
 	// Now is the wall clock used for key expiry (default time.Now). Tests
 	// and simulations can replace it to control time.
 	Now func() time.Time
+	// SweepInterval, when positive, starts a background goroutine that
+	// removes expired keys from the in-memory index at this interval, so
+	// keys that are never read again do not hold memory until the next
+	// Merge. Expired keys are invisible either way.
+	SweepInterval time.Duration
 }
 
 type entry struct {
@@ -79,6 +84,10 @@ type DB struct {
 
 	clock  uint64
 	closed bool
+
+	sweepStop chan struct{}
+	sweepDone chan struct{}
+	stopOnce  sync.Once
 }
 
 const (
@@ -131,6 +140,10 @@ func Open(dir string, opts *Options) (*DB, error) {
 		if e.expired(now) {
 			delete(db.keydir, k)
 		}
+	}
+	if o.SweepInterval > 0 {
+		db.sweepStop, db.sweepDone = make(chan struct{}), make(chan struct{})
+		go db.sweepLoop(o.SweepInterval)
 	}
 	return db, nil
 }
@@ -455,6 +468,7 @@ func (db *DB) Sync() error {
 type Stats struct {
 	Keys      int // live keys, excluding expired ones
 	Expiring  int // live keys that have an expiry set
+	Expired   int // expired keys still indexed, awaiting a sweep or merge
 	DataFiles int
 	DiskBytes int64 // total size of all data files
 	LiveBytes int64 // bytes occupied by the latest version of live keys
@@ -471,6 +485,7 @@ func (db *DB) Stats() (Stats, error) {
 	now := db.nowMs()
 	for _, e := range db.keydir {
 		if e.expired(now) {
+			s.Expired++
 			continue
 		}
 		s.Keys++
@@ -491,6 +506,7 @@ func (db *DB) Stats() (Stats, error) {
 
 // Close syncs and closes the database. Further calls return ErrClosed.
 func (db *DB) Close() error {
+	db.stopSweeper()
 	db.mergeMu.Lock()
 	defer db.mergeMu.Unlock()
 	db.mu.Lock()
